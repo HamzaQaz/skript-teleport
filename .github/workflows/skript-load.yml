@@ -2,14 +2,16 @@
 #  Boots a real Paper server with a real Skript and loads this folder into it.
 #
 #  Skript reports parse errors at load time and nowhere else -- there is no
-#  linter that understands its grammar, and a bad clause order or a nested
-#  quote will happily sit in a commit looking fine. The only honest test is
-#  to start a server and read the log, so that is what this does.
+#  linter that understands its grammar, so a bad clause order or a nested
+#  quote sits in a commit looking perfectly fine. The only honest check is to
+#  start a server and read the log.
 #
-#  Fails the job if Skript reports any error, OR if the load markers this
-#  folder prints on success are missing (which catches the case where the
-#  scripts were never picked up at all and the log is clean because nothing
-#  ran).
+#  Fails on any Skript error, and also if the on-load marker this folder
+#  prints is missing -- otherwise a run where nothing loaded at all would
+#  pass by virtue of a quiet log.
+#
+#  Everything is resolved from the PaperMC API at run time, including the
+#  minimum Java version, so this does not rot when Paper moves.
 # ============================================================================
 
 name: Skript load test
@@ -24,52 +26,57 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # Folder name under plugins/Skript/scripts/
       SCRIPT_DIR: teleport
-      # A line this folder logs on a successful load. If it is missing the
-      # scripts did not run, however quiet the log was.
       EXPECT: '[Teleport] Core loaded'
-      # Blank = whatever Paper's API says is newest. Pin it if you need to.
-      MC_VERSION: ''
-      JAVA_VERSION: '21'
+      MC_VERSION: ''          # blank = newest Paper release
+      UA: 'skript-load-ci (github actions)'
 
     steps:
       - uses: actions/checkout@v4
         with:
           path: repo
 
+      # Paper states its own Java floor, so ask rather than guess -- 26.2
+      # needs 25, and pinning 21 fails before Skript is even reached.
+      - name: Resolve Paper build
+        id: paper
+        run: |
+          set -euo pipefail
+          API=https://fill.papermc.io/v3/projects/paper
+          V="${MC_VERSION}"
+          if [ -z "$V" ]; then
+            V=$(curl -sf -A "$UA" "$API" | jq -r '[.versions[][]] | .[0]')
+          fi
+          URL=$(curl -sf -A "$UA" "$API/versions/$V/builds" \
+                | jq -r '[.[] | select(.channel=="STABLE")][0].downloads["server:default"].url // empty')
+          if [ -z "$URL" ]; then
+            URL=$(curl -sf -A "$UA" "$API/versions/$V/builds/latest" \
+                  | jq -r '.downloads["server:default"].url')
+          fi
+          JAVA=$(curl -sf -A "$UA" "$API/versions/$V" | jq -r '.version.java.version.minimum // 21')
+          echo "Paper $V, Java $JAVA"
+          echo "version=$V"   >> "$GITHUB_OUTPUT"
+          echo "url=$URL"     >> "$GITHUB_OUTPUT"
+          echo "java=$JAVA"   >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: ${{ steps.paper.outputs.java }}
 
-      - name: Resolve and download Paper
+      - name: Download server and plugins
         run: |
           set -euo pipefail
           mkdir -p server/plugins
-          V="${MC_VERSION}"
-          if [ -z "$V" ]; then
-            V=$(curl -sf https://api.papermc.io/v2/projects/paper | jq -r '.versions[-1]')
-          fi
-          B=$(curl -sf "https://api.papermc.io/v2/projects/paper/versions/$V/builds" \
-              | jq -r '[.builds[] | select(.channel=="default")] | last | .build // empty')
-          if [ -z "$B" ]; then
-            B=$(curl -sf "https://api.papermc.io/v2/projects/paper/versions/$V/builds" | jq -r '.builds[-1].build')
-          fi
-          echo "Paper $V build $B"
-          curl -sf -o server/paper.jar \
-            "https://api.papermc.io/v2/projects/paper/versions/$V/builds/$B/downloads/paper-$V-$B.jar"
+          curl -sfL -o server/paper.jar "${{ steps.paper.outputs.url }}"
 
-      - name: Download Skript and Vault
-        run: |
-          set -euo pipefail
           SK=$(curl -sf https://api.github.com/repos/SkriptLang/Skript/releases/latest \
                | jq -r '[.assets[] | select(.name | endswith(".jar"))] | .[0].browser_download_url')
           echo "Skript: $SK"
           curl -sfL -o server/plugins/Skript.jar "$SK"
-          # Vault must be present or Skript never registers the `balance`
-          # expression, and every money line reports a parse error that is
-          # not real.
+
+          # Without Vault, Skript never registers the `balance` expression and
+          # every money line reports a parse error that is not real.
           VA=$(curl -sf https://api.github.com/repos/MilkBowl/Vault/releases/latest \
                | jq -r '[.assets[] | select(.name | endswith(".jar"))] | .[0].browser_download_url')
           echo "Vault: $VA"
@@ -78,21 +85,23 @@ jobs:
       - name: Stage scripts and server config
         run: |
           set -euo pipefail
-          mkdir -p "server/plugins/Skript/scripts/$SCRIPT_DIR"
-          find repo -maxdepth 1 -name '*.sk' -exec cp {} "server/plugins/Skript/scripts/$SCRIPT_DIR/" \;
-          echo "staged $(ls -1 "server/plugins/Skript/scripts/$SCRIPT_DIR" | wc -l) script(s):"
-          ls -1 "server/plugins/Skript/scripts/$SCRIPT_DIR"
+          DEST="server/plugins/Skript/scripts/$SCRIPT_DIR"
+          mkdir -p "$DEST"
+          find repo -maxdepth 1 -name '*.sk' -exec cp {} "$DEST/" \;
+          N=$(ls -1 "$DEST" | wc -l)
+          echo "staged $N script(s)"; ls -1 "$DEST"
+          if [ "$N" -eq 0 ]; then echo "::error::no .sk files found"; exit 1; fi
           echo "eula=true" > server/eula.txt
-          cat > server/server.properties <<'EOF'
-          online-mode=false
-          level-type=minecraft\:flat
-          generate-structures=false
-          spawn-protection=0
-          view-distance=3
-          simulation-distance=3
-          max-players=1
-          motd=skript-ci
-          EOF
+          {
+            echo "online-mode=false"
+            echo "level-type=minecraft\\:flat"
+            echo "generate-structures=false"
+            echo "spawn-protection=0"
+            echo "view-distance=3"
+            echo "simulation-distance=3"
+            echo "max-players=1"
+            echo "motd=skript-ci"
+          } > server/server.properties
 
       - name: Boot server, wait for load, stop cleanly
         run: |
@@ -102,7 +111,7 @@ jobs:
           java -Xms1G -Xmx2G -jar paper.jar --nogui < cmd > console.log 2>&1 &
           PID=$!
           exec 3> cmd
-          for _ in $(seq 1 240); do
+          for _ in $(seq 1 300); do
             grep -q 'Done (' console.log && break
             kill -0 "$PID" 2>/dev/null || break
             sleep 1
@@ -122,24 +131,14 @@ jobs:
           set -uo pipefail
           LOG=server/console.log
           FAIL=0
-
-          if grep -qE 'Encountered [0-9]+ error' "$LOG"; then
-            echo "::error::Skript reported parse errors"
-            FAIL=1
-          fi
-          if grep -qE 'Line [0-9]+: *\(' "$LOG"; then
-            echo "::error::Skript reported at least one script error"
-            FAIL=1
-          fi
+          grep -qE 'Encountered [0-9]+ error' "$LOG" && { echo "::error::Skript reported parse errors"; FAIL=1; }
+          grep -qE 'Line [0-9]+: *\('   "$LOG" && { echo "::error::Skript reported a script error"; FAIL=1; }
           if ! grep -qF "$EXPECT" "$LOG"; then
-            echo "::error::Load marker not found: $EXPECT"
-            echo "The scripts did not run. A clean log here means nothing loaded."
+            echo "::error::load marker missing: $EXPECT -- the scripts never ran"
             FAIL=1
           fi
-
           if [ "$FAIL" -ne 0 ]; then
-            echo
-            echo "================ errors ================"
+            echo; echo "================ errors ================"
             grep -nE -A4 'Line [0-9]+: *\(|Encountered [0-9]+ error' "$LOG" | head -120
             exit 1
           fi
