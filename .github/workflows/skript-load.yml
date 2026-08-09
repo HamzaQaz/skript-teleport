@@ -1,0 +1,153 @@
+# ============================================================================
+#  Boots a real Paper server with a real Skript and loads this folder into it.
+#
+#  Skript reports parse errors at load time and nowhere else -- there is no
+#  linter that understands its grammar, and a bad clause order or a nested
+#  quote will happily sit in a commit looking fine. The only honest test is
+#  to start a server and read the log, so that is what this does.
+#
+#  Fails the job if Skript reports any error, OR if the load markers this
+#  folder prints on success are missing (which catches the case where the
+#  scripts were never picked up at all and the log is clean because nothing
+#  ran).
+# ============================================================================
+
+name: Skript load test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Folder name under plugins/Skript/scripts/
+      SCRIPT_DIR: teleport
+      # A line this folder logs on a successful load. If it is missing the
+      # scripts did not run, however quiet the log was.
+      EXPECT: '[Teleport] Core loaded'
+      # Blank = whatever Paper's API says is newest. Pin it if you need to.
+      MC_VERSION: ''
+      JAVA_VERSION: '21'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Resolve and download Paper
+        run: |
+          set -euo pipefail
+          mkdir -p server/plugins
+          V="${MC_VERSION}"
+          if [ -z "$V" ]; then
+            V=$(curl -sf https://api.papermc.io/v2/projects/paper | jq -r '.versions[-1]')
+          fi
+          B=$(curl -sf "https://api.papermc.io/v2/projects/paper/versions/$V/builds" \
+              | jq -r '[.builds[] | select(.channel=="default")] | last | .build // empty')
+          if [ -z "$B" ]; then
+            B=$(curl -sf "https://api.papermc.io/v2/projects/paper/versions/$V/builds" | jq -r '.builds[-1].build')
+          fi
+          echo "Paper $V build $B"
+          curl -sf -o server/paper.jar \
+            "https://api.papermc.io/v2/projects/paper/versions/$V/builds/$B/downloads/paper-$V-$B.jar"
+
+      - name: Download Skript and Vault
+        run: |
+          set -euo pipefail
+          SK=$(curl -sf https://api.github.com/repos/SkriptLang/Skript/releases/latest \
+               | jq -r '[.assets[] | select(.name | endswith(".jar"))] | .[0].browser_download_url')
+          echo "Skript: $SK"
+          curl -sfL -o server/plugins/Skript.jar "$SK"
+          # Vault must be present or Skript never registers the `balance`
+          # expression, and every money line reports a parse error that is
+          # not real.
+          VA=$(curl -sf https://api.github.com/repos/MilkBowl/Vault/releases/latest \
+               | jq -r '[.assets[] | select(.name | endswith(".jar"))] | .[0].browser_download_url')
+          echo "Vault: $VA"
+          curl -sfL -o server/plugins/Vault.jar "$VA"
+
+      - name: Stage scripts and server config
+        run: |
+          set -euo pipefail
+          mkdir -p "server/plugins/Skript/scripts/$SCRIPT_DIR"
+          find repo -maxdepth 1 -name '*.sk' -exec cp {} "server/plugins/Skript/scripts/$SCRIPT_DIR/" \;
+          echo "staged $(ls -1 "server/plugins/Skript/scripts/$SCRIPT_DIR" | wc -l) script(s):"
+          ls -1 "server/plugins/Skript/scripts/$SCRIPT_DIR"
+          echo "eula=true" > server/eula.txt
+          cat > server/server.properties <<'EOF'
+          online-mode=false
+          level-type=minecraft\:flat
+          generate-structures=false
+          spawn-protection=0
+          view-distance=3
+          simulation-distance=3
+          max-players=1
+          motd=skript-ci
+          EOF
+
+      - name: Boot server, wait for load, stop cleanly
+        run: |
+          set -uo pipefail
+          cd server
+          mkfifo cmd
+          java -Xms1G -Xmx2G -jar paper.jar --nogui < cmd > console.log 2>&1 &
+          PID=$!
+          exec 3> cmd
+          for _ in $(seq 1 240); do
+            grep -q 'Done (' console.log && break
+            kill -0 "$PID" 2>/dev/null || break
+            sleep 1
+          done
+          echo stop >&3 || true
+          for _ in $(seq 1 60); do
+            kill -0 "$PID" 2>/dev/null || break
+            sleep 1
+          done
+          kill -9 "$PID" 2>/dev/null || true
+          exec 3>&- || true
+          echo "--- Skript output ---"
+          grep -iE '\[Skript\]|\.sk\)|Line [0-9]+:' console.log || true
+
+      - name: Check for Skript errors
+        run: |
+          set -uo pipefail
+          LOG=server/console.log
+          FAIL=0
+
+          if grep -qE 'Encountered [0-9]+ error' "$LOG"; then
+            echo "::error::Skript reported parse errors"
+            FAIL=1
+          fi
+          if grep -qE 'Line [0-9]+: *\(' "$LOG"; then
+            echo "::error::Skript reported at least one script error"
+            FAIL=1
+          fi
+          if ! grep -qF "$EXPECT" "$LOG"; then
+            echo "::error::Load marker not found: $EXPECT"
+            echo "The scripts did not run. A clean log here means nothing loaded."
+            FAIL=1
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo
+            echo "================ errors ================"
+            grep -nE -A4 'Line [0-9]+: *\(|Encountered [0-9]+ error' "$LOG" | head -120
+            exit 1
+          fi
+          echo "Skript loaded $SCRIPT_DIR with no errors."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: server-log
+          path: server/console.log
+          retention-days: 7

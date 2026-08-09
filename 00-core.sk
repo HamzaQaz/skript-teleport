@@ -149,9 +149,16 @@ function tp_sound(p: player, id: text, pitch: number):
     if {tp::cfg::sounds} is true:
         play sound {_id} with volume 0.6 with pitch {_pitch} to {_p}
 
+# `secs` is accepted but not used. Skript's title effect only matches
+# `to %players%` in one specific slot, and adding either a `for %timespan%`
+# or a fade clause pushes it out of that slot -- the target then falls back
+# to the command sender, which does not exist inside a function, and the
+# whole script fails to load with "There's no command sender in a function
+# event". The vanilla title duration is fine; the parameter stays so call
+# sites don't have to change if a later Skript version fixes the pattern.
 function tp_title(p: player, top: text, sub: text, secs: number):
     if {tp::cfg::titles} is true:
-        send title {_top} with subtitle {_sub} to {_p} for {_secs} seconds
+        send title {_top} with subtitle {_sub} to {_p}
 
 
 # ============================================================================
