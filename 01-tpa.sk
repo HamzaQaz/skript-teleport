@@ -1,0 +1,424 @@
+# ============================================================================
+#  TELEPORT SUITE  ·  01-tpa
+#  The request model, its commands, and expiry. No GUI code lives here --
+#  see 02-tpa-gui. Everything the menu does, it does by calling these
+#  functions, so /tpa and the chest UI can never drift apart.
+# ----------------------------------------------------------------------------
+#  DATA MODEL
+#
+#    {tpa::r::<sender>::<target>::type}   "to" or "here"
+#    {tpa::r::<sender>::<target>::at}     unix timestamp it was sent
+#    {tpa::r::<sender>::<target>::sname}  sender name, cached for offline
+#    {tpa::r::<sender>::<target>::tname}  target name, cached for offline
+#    {tpa::in::<target>::<sender>}        true   -- inbox index
+#    {tpa::out::<sender>::<target>}       true   -- outbox index
+#
+#  Two indexes over one record. A request is only real when all three
+#  exist, and tpa_drop() is the only thing that removes them, so a half
+#  deleted request can't linger in someone's menu.
+#
+#  "to"   -- the sender travels to the target.  (/tpa)
+#  "here" -- the target travels to the sender.  (/tpahere)
+#  Whoever moves is decided in tpa_accept(), never assumed anywhere else.
+# ============================================================================
+
+function tpa_key(p: offline player) :: text:
+    return "%uuid of {_p}%"
+
+function tpa_has(s: text, t: text) :: boolean:
+    if {tpa::r::%{_s}%::%{_t}%::at} is set:
+        return true
+    return false
+
+function tpa_age(s: text, t: text) :: number:
+    return tp_now() - ({tpa::r::%{_s}%::%{_t}%::at} ? 0)
+
+function tpa_left(s: text, t: text) :: number:
+    return max(0, {tp::cfg::tpa_expire} - tpa_age({_s}, {_t}))
+
+function tpa_drop(s: text, t: text):
+    delete {tpa::r::%{_s}%::%{_t}%::*}
+    delete {tpa::in::%{_t}%::%{_s}%}
+    delete {tpa::out::%{_s}%::%{_t}%}
+
+function tpa_count_in(t: text) :: integer:
+    return size of {tpa::in::%{_t}%::*}
+
+function tpa_count_out(s: text) :: integer:
+    return size of {tpa::out::%{_s}%::*}
+
+# Most recent request in someone's inbox. This is what a bare /tpaccept
+# with no name resolves to -- newest first, because the person who just
+# pinged you is who you meant.
+function tpa_newest_in(t: text) :: text:
+    set {_best} to ""
+    set {_bat} to 0
+    loop {tpa::in::%{_t}%::*}:
+        set {_s} to loop-index
+        set {_at} to {tpa::r::%{_s}%::%{_t}%::at} ? 0
+        if {_at} > {_bat}:
+            set {_bat} to {_at}
+            set {_best} to {_s}
+    return {_best}
+
+function tpa_newest_out(s: text) :: text:
+    set {_best} to ""
+    set {_bat} to 0
+    loop {tpa::out::%{_s}%::*}:
+        set {_t} to loop-index
+        set {_at} to {tpa::r::%{_s}%::%{_t}%::at} ? 0
+        if {_at} > {_bat}:
+            set {_bat} to {_at}
+            set {_best} to {_t}
+    return {_best}
+
+# Returns nothing when they are offline, so callers just test `is set`.
+function tpa_online(id: text) :: player:
+    loop all players:
+        if "%uuid of loop-player%" is {_id}:
+            set {_r} to loop-player
+            exit loop
+    return {_r}
+
+
+# ============================================================================
+#  PREFERENCES
+#  Off-by-default everywhere: a fresh player accepts requests and hears
+#  sounds without having to find a menu.
+# ============================================================================
+
+function tpa_accepting(p: offline player) :: boolean:
+    if {tpa::pref::dnd::%tpa_key({_p})%} is true:
+        return false
+    return true
+
+function tpa_dnd_flip(p: player):
+    if tpa_accepting({_p}) is true:
+        set {tpa::pref::dnd::%tpa_key({_p})%} to true
+    else:
+        delete {tpa::pref::dnd::%tpa_key({_p})%}
+
+function tpa_blocked(owner: text, other: text) :: boolean:
+    if {tpa::block::%{_owner}%::%{_other}%} is set:
+        return true
+    return false
+
+# The default action when you click a head in the player picker.
+function tpa_picktype(p: player) :: text:
+    return {tpa::pref::pick::%tpa_key({_p})%} ? "to"
+
+function tpa_picktype_flip(p: player):
+    if tpa_picktype({_p}) is "to":
+        set {tpa::pref::pick::%tpa_key({_p})%} to "here"
+    else:
+        set {tpa::pref::pick::%tpa_key({_p})%} to "to"
+
+
+# ============================================================================
+#  SENDING
+# ============================================================================
+
+function tpa_send(s: player, t: player, type: text) :: boolean:
+    set {_sid} to tpa_key({_s})
+    set {_tid} to tpa_key({_t})
+
+    if {_sid} is {_tid}:
+        tp_err({_s}, "You are already there.")
+        return false
+
+    if {_t} is not online:
+        tp_err({_s}, "They aren't online.")
+        return false
+
+    if tpa_accepting({_t}) is false:
+        tp_err({_s}, "<yellow>%{_t}%<red> isn't accepting teleport requests.")
+        return false
+
+    if tpa_blocked({_tid}, {_sid}) is true:
+        # Deliberately the same wording as "not accepting". Telling someone
+        # they have been blocked individually is how block lists turn into
+        # an argument in public chat.
+        tp_err({_s}, "<yellow>%{_t}%<red> isn't accepting teleport requests.")
+        return false
+
+    if {tp::cfg::tpa_cross_world} is false:
+        if world of {_s} is not world of {_t}:
+            tp_err({_s}, "They're in another world.")
+            return false
+
+    if tpa_has({_sid}, {_tid}) is true:
+        tp_err({_s}, "You already have a request out to <yellow>%{_t}%<red>.")
+        return false
+
+    if tpa_count_out({_sid}) >= {tp::cfg::tpa_max_out}:
+        tp_err({_s}, "Too many requests pending. <yellow>/tpa<red> to manage them.")
+        return false
+
+    if tp_cd_ready({_s}, "tpa") is false:
+        return false
+
+    set {tpa::r::%{_sid}%::%{_tid}%::type} to {_type}
+    set {tpa::r::%{_sid}%::%{_tid}%::at} to tp_now()
+    set {tpa::r::%{_sid}%::%{_tid}%::sname} to "%{_s}%"
+    set {tpa::r::%{_sid}%::%{_tid}%::tname} to "%{_t}%"
+    set {tpa::in::%{_tid}%::%{_sid}%} to true
+    set {tpa::out::%{_sid}%::%{_tid}%} to true
+    tp_cd_set({_s}, "tpa", {tp::cfg::tpa_cooldown})
+
+    if {_type} is "to":
+        set {_verb} to "wants to teleport to you"
+        tp_ok({_s}, "Request sent to <white>%{_t}%<green>. <dark_gray>expires in %tp_dur({tp::cfg::tpa_expire})%")
+    else:
+        set {_verb} to "wants you to teleport to them"
+        tp_ok({_s}, "Asked <white>%{_t}%<green> to come to you. <dark_gray>expires in %tp_dur({tp::cfg::tpa_expire})%")
+    tp_sound({_s}, "block.note_block.pling", 1.4)
+
+    send "" to {_t}
+    send "%tpfx()%<white>%{_s}%<gray> %{_verb}%." to {_t}
+    send "%tpfx()%<green><u>/tpaccept %{_s}%</u><dark_gray> · <red><u>/tpdeny %{_s}%</u><dark_gray> · <gray><u>/tpa</u>" to {_t}
+    send "%tpfx()%<dark_gray>Expires in %tp_dur({tp::cfg::tpa_expire})%." to {_t}
+    send "" to {_t}
+    tp_sound({_t}, "entity.experience_orb.pickup", 1.2)
+    tp_title({_t}, "<aqua>Teleport request", "<gray>from <white>%{_s}%", 3)
+    return true
+
+
+# ============================================================================
+#  RESOLVING
+# ============================================================================
+
+function tpa_accept(t: player, sid: text) :: boolean:
+    set {_tid} to tpa_key({_t})
+
+    if tpa_has({_sid}, {_tid}) is false:
+        tp_err({_t}, "No such request. It may have expired.")
+        return false
+
+    if tpa_left({_sid}, {_tid}) <= 0:
+        tpa_drop({_sid}, {_tid})
+        tp_err({_t}, "That request already expired.")
+        return false
+
+    set {_s} to tpa_online({_sid})
+    if {_s} is not set:
+        tpa_drop({_sid}, {_tid})
+        tp_err({_t}, "They went offline.")
+        return false
+
+    set {_type} to {tpa::r::%{_sid}%::%{_tid}%::type}
+    tpa_drop({_sid}, {_tid})
+
+    # Decide who actually moves. This is the ONLY place that decision is
+    # made -- every message and every cost below reads from {_mover}.
+    if {_type} is "to":
+        set {_mover} to {_s}
+        set {_anchor} to {_t}
+    else:
+        set {_mover} to {_t}
+        set {_anchor} to {_s}
+
+    if {tp::cfg::tpa_cross_world} is false:
+        if world of {_mover} is not world of {_anchor}:
+            tp_err({_t}, "You aren't in the same world any more.")
+            return false
+
+    if tp_warming({_mover}) is true:
+        tp_err({_t}, "<yellow>%{_mover}%<red> is already teleporting.")
+        return false
+
+    if tp_charge({_mover}, {tp::cfg::tpa_cost}, "tpa") is false:
+        if {_mover} is not {_t}:
+            tp_err({_t}, "<yellow>%{_mover}%<red> couldn't afford the teleport.")
+        return false
+
+    tp_ok({_t}, "Accepted.")
+    tp_sound({_t}, "entity.experience_orb.pickup", 2)
+    tp_ok({_s}, "<white>%{_t}%<green> accepted your request.")
+    tp_sound({_s}, "entity.experience_orb.pickup", 2)
+
+    tp_warmup({_mover}, location of {_anchor}, tpa_key({_anchor}), "Teleporting to %{_anchor}%", "tpa")
+    return true
+
+function tpa_deny(t: player, sid: text) :: boolean:
+    set {_tid} to tpa_key({_t})
+    if tpa_has({_sid}, {_tid}) is false:
+        tp_err({_t}, "No such request.")
+        return false
+    set {_name} to {tpa::r::%{_sid}%::%{_tid}%::sname} ? "someone"
+    tpa_drop({_sid}, {_tid})
+    tp_msg({_t}, "<gray>Denied <white>%{_name}%<gray>.")
+    tp_sound({_t}, "block.note_block.bass", 0.8)
+    set {_s} to tpa_online({_sid})
+    if {_s} is set:
+        tp_err({_s}, "<yellow>%{_t}%<red> denied your request.")
+    return true
+
+function tpa_cancel(s: player, tid: text) :: boolean:
+    set {_sid} to tpa_key({_s})
+    if tpa_has({_sid}, {_tid}) is false:
+        tp_err({_s}, "You have no request out to them.")
+        return false
+    set {_name} to {tpa::r::%{_sid}%::%{_tid}%::tname} ? "them"
+    tpa_drop({_sid}, {_tid})
+    tp_msg({_s}, "<gray>Cancelled your request to <white>%{_name}%<gray>.")
+    set {_t} to tpa_online({_tid})
+    if {_t} is set:
+        tp_msg({_t}, "<gray><white>%{_s}%<gray> withdrew their teleport request.")
+    return true
+
+function tpa_deny_all(t: player) :: integer:
+    set {_tid} to tpa_key({_t})
+    set {_n} to 0
+    clear {_ids::*}
+    loop {tpa::in::%{_tid}%::*}:
+        add loop-index to {_ids::*}
+    loop {_ids::*}:
+        tpa_deny({_t}, loop-value)
+        add 1 to {_n}
+    return {_n}
+
+
+# ---------------------------------------------------------------------------
+#  EXPIRY
+#  Requests are checked lazily on read AND swept here, because a stale
+#  record that nobody opens still counts against tpa_max_out.
+# ---------------------------------------------------------------------------
+
+every 10 seconds:
+    set {_cut} to tp_now() - {tp::cfg::tpa_expire}
+
+    # Collect first, delete second. tpa_drop() edits the very lists we are
+    # walking, and mutating a list mid-loop is how you end up with records
+    # that exist in one index and not the other.
+    clear {_dead::*}
+    loop {tpa::out::*}:
+        set {_sid} to loop-index
+        loop {tpa::out::%{_sid}%::*}:
+            if ({tpa::r::%{_sid}%::%loop-index-2%::at} ? 0) < {_cut}:
+                add "%{_sid}%|%loop-index-2%" to {_dead::*}
+
+    loop {_dead::*}:
+        set {_pair::*} to loop-value split at "|"
+        set {_sid} to {_pair::1}
+        set {_tid} to {_pair::2}
+        set {_sname} to {tpa::r::%{_sid}%::%{_tid}%::sname} ? "someone"
+        set {_tname} to {tpa::r::%{_sid}%::%{_tid}%::tname} ? "someone"
+        tpa_drop({_sid}, {_tid})
+        set {_s} to tpa_online({_sid})
+        if {_s} is set:
+            tp_msg({_s}, "<dark_gray>Your request to %{_tname}% expired.")
+        set {_t} to tpa_online({_tid})
+        if {_t} is set:
+            tp_msg({_t}, "<dark_gray>The request from %{_sname}% expired.")
+
+
+# ============================================================================
+#  COMMANDS
+#
+#  EssentialsX registers /tpa, /tpahere, /tpaccept, /tpdeny, /tpacancel and
+#  /tptoggle. Whichever plugin registers first wins the bare name and the
+#  other is only reachable as /essentials:tpa. Disable them on the Essentials
+#  side -- see the README. The aliases below are the belt to that braces.
+# ============================================================================
+
+command /tpa [<player>]:
+    aliases: /call, /tprequest
+    permission: teleport.tpa
+    permission message: <red>You don't have access to that.
+    executable by: players
+    trigger:
+        if arg-1 is not set:
+            tpa_hub(player)
+            stop
+        tpa_send(player, arg-1, "to")
+
+command /tpahere [<player>]:
+    # NOT /tphere -- that is EssentialsX's staff command for pulling a player
+    # to you, which is worth keeping. /tpask is freed up as soon as Essentials'
+    # own tpa is disabled, since disabling a command kills its aliases too.
+    aliases: /tpask
+    permission: teleport.tpa
+    permission message: <red>You don't have access to that.
+    executable by: players
+    trigger:
+        if arg-1 is not set:
+            tp_err(player, "/tpahere <player>")
+            stop
+        tpa_send(player, arg-1, "here")
+
+command /tpaccept [<player>]:
+    aliases: /tpyes, /tpacc
+    permission: teleport.tpa
+    executable by: players
+    trigger:
+        set {_id} to tpa_key(player)
+        if arg-1 is set:
+            tpa_accept(player, tpa_key(arg-1))
+            stop
+        set {_s} to tpa_newest_in({_id})
+        if {_s} is "":
+            tp_err(player, "You have no pending requests.")
+            stop
+        tpa_accept(player, {_s})
+
+command /tpdeny [<player>]:
+    aliases: /tpno, /tpadeny
+    permission: teleport.tpa
+    executable by: players
+    trigger:
+        set {_id} to tpa_key(player)
+        if arg-1 is set:
+            tpa_deny(player, tpa_key(arg-1))
+            stop
+        set {_s} to tpa_newest_in({_id})
+        if {_s} is "":
+            tp_err(player, "You have no pending requests.")
+            stop
+        tpa_deny(player, {_s})
+
+command /tpacancel [<player>]:
+    aliases: /tpcancel
+    permission: teleport.tpa
+    executable by: players
+    trigger:
+        set {_id} to tpa_key(player)
+        if arg-1 is set:
+            tpa_cancel(player, tpa_key(arg-1))
+            stop
+        set {_t} to tpa_newest_out({_id})
+        if {_t} is "":
+            tp_err(player, "You have nothing pending.")
+            stop
+        tpa_cancel(player, {_t})
+
+command /tpatoggle:
+    aliases: /tptoggle, /dnd
+    permission: teleport.tpa
+    executable by: players
+    trigger:
+        tpa_dnd_flip(player)
+        if tpa_accepting(player) is true:
+            tp_ok(player, "Now accepting teleport requests.")
+        else:
+            tp_msg(player, "<yellow>Requests are now blocked. Nobody can /tpa you.")
+
+command /tpablock [<offline player>]:
+    aliases: /tpignore
+    permission: teleport.tpa
+    executable by: players
+    trigger:
+        if arg-1 is not set:
+            tpa_block_menu(player)
+            stop
+        set {_me} to tpa_key(player)
+        set {_o} to tpa_key(arg-1)
+        if {_me} is {_o}:
+            tp_err(player, "You cannot block yourself.")
+            stop
+        if tpa_blocked({_me}, {_o}) is true:
+            delete {tpa::block::%{_me}%::%{_o}%}
+            tp_ok(player, "Unblocked <white>%arg-1%<green>.")
+        else:
+            set {tpa::block::%{_me}%::%{_o}%} to "%arg-1%"
+            tpa_drop({_o}, {_me})
+            tp_msg(player, "<yellow>Blocked <white>%arg-1%<yellow>. They can't request you.")

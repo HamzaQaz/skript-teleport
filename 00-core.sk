@@ -1,0 +1,469 @@
+# ============================================================================
+#  TELEPORT SUITE  ·  00-core
+#  Config tree, formatting, cooldowns, the warmup engine, and the chest-UI
+#  toolkit. Loads first. Everything else depends on this file.
+# ----------------------------------------------------------------------------
+#  Skript options: are FILE-LOCAL. Functions and variables are GLOBAL.
+#  So all tunables live in {tp::cfg::*}, seeded once on first load.
+#
+#  Changing a default below will NOT apply after first load -- the variable
+#  already exists. Use /tpadmin config set <key> <value>, or wipe with
+#  /tpadmin config reset.
+#
+#  Everything here is prefixed tp_ / tpui_ / {tp::*} on purpose, so this can
+#  live on the same server as the Ducat economy without colliding with its
+#  gui_*, r(), comma(), dur() or pfx() helpers. Duplicate function names are
+#  a load error, not a warning.
+# ============================================================================
+
+function tp_default(key: text, value: object):
+    if {tp::cfg::%{_key}%} is not set:
+        set {tp::cfg::%{_key}%} to {_value}
+
+function tp_seed():
+    # -- presentation -------------------------------------------------------
+    tp_default("pfx", "<aqua>Teleport <dark_gray>»<gray> ")
+    tp_default("sounds", true)              # global kill switch for all sound
+    tp_default("titles", true)              # warmup countdown / arrival titles
+
+    # -- tpa ----------------------------------------------------------------
+    tp_default("tpa_expire", 120)           # seconds a request stays alive
+    tp_default("tpa_warmup", 3)             # 0 = instant, no countdown
+    tp_default("tpa_cooldown", 15)          # between SENDING requests
+    tp_default("tpa_cross_world", true)
+    tp_default("tpa_max_out", 5)            # simultaneous outgoing requests
+    tp_default("tpa_cost", 0)               # charged to whoever teleports
+
+    # -- rtp ----------------------------------------------------------------
+    tp_default("rtp_warmup", 5)
+    tp_default("rtp_cooldown", 300)
+    tp_default("rtp_cost", 0)
+    tp_default("rtp_water", false)          # allow landing on water/ocean
+    # Ring distances and search budget live in 03-rtp.sk
+
+    # -- movement / safety --------------------------------------------------
+    tp_default("cancel_on_move", true)
+    tp_default("cancel_on_damage", true)
+    tp_default("move_tolerance", 0.75)      # blocks of slack during warmup
+    tp_default("nofall", 8)                 # seconds of fall immunity after
+    tp_default("back_enabled", true)        # /tpback
+
+on load:
+    tp_seed()
+    log "[Teleport] Core loaded."
+
+
+# ============================================================================
+#  FORMATTING
+# ============================================================================
+
+function tpfx() :: text:
+    return "%{tp::cfg::pfx}%"
+
+function tp_r(n: number, places: integer) :: number:
+    set {_m} to 10 ^ {_places}
+    return (round({_n} * {_m})) / {_m}
+
+# 1234567 -> "1,234,567"
+function tp_comma(n: number) :: text:
+    set {_s} to "%floor(abs({_n}))%"
+    set {_len} to length of {_s}
+    set {_out} to ""
+    set {_c} to 0
+    loop {_len} times:
+        set {_idx} to {_len} - loop-value + 1
+        set {_ch} to subtext of {_s} from characters {_idx} to {_idx}
+        add 1 to {_c}
+        if {_c} > 1:
+            if mod({_c} - 1, 3) is 0:
+                set {_out} to ",%{_out}%"
+        set {_out} to "%{_ch}%%{_out}%"
+    if {_n} < 0:
+        return "-%{_out}%"
+    return {_out}
+
+function tp_dur(seconds: number) :: text:
+    if {_seconds} <= 0:
+        return "now"
+    if {_seconds} < 60:
+        return "%floor({_seconds})%s"
+    if {_seconds} < 3600:
+        return "%floor({_seconds} / 60)%m %floor(mod({_seconds}, 60))%s"
+    if {_seconds} < 86400:
+        return "%floor({_seconds} / 3600)%h %floor(mod({_seconds}, 3600) / 60)%m"
+    return "%floor({_seconds} / 86400)%d"
+
+function tp_now() :: number:
+    return unix timestamp of now
+
+# Progress / capacity bar. frac is 0..1.
+function tp_bar(frac: number, width: integer, col: text) :: text:
+    set {_f} to max(0, min(1, {_frac}))
+    set {_on} to round({_f} * {_width})
+    set {_out} to "%{_col}%"
+    loop {_width} times:
+        if loop-value <= {_on}:
+            set {_out} to "%{_out}%▰"
+        else:
+            if loop-value is {_on} + 1:
+                set {_out} to "%{_out}%<dark_gray>"
+            set {_out} to "%{_out}%▱"
+    return {_out}
+
+# "world · 1,204, 71, -388"
+function tp_where(l: location) :: text:
+    return "%world of {_l}%<dark_gray> · <gray>%tp_comma(x of {_l})%, %floor(y of {_l})%, %tp_comma(z of {_l})%"
+
+# "old_growth_pine_taiga" -> "old growth pine taiga"
+function tp_biome(l: location) :: text:
+    set {_b} to "%biome at {_l}%" in lower case
+    replace all "minecraft:" in {_b} with ""
+    replace all "_" in {_b} with " "
+    return {_b}
+
+# Normalised, underscore-joined biome key used for profile matching.
+function tp_biome_key(l: location) :: text:
+    set {_b} to "%biome at {_l}%" in lower case
+    replace all "minecraft:" in {_b} with ""
+    replace all " " in {_b} with "_"
+    return {_b}
+
+
+# ============================================================================
+#  FEEDBACK
+#  One place to route every message and sound, so muting the suite is a
+#  single config flip rather than a grep.
+# ============================================================================
+
+function tp_msg(p: player, body: text):
+    send "%tpfx()%%{_body}%" to {_p}
+
+function tp_ok(p: player, body: text):
+    send "%tpfx()%<green>%{_body}%" to {_p}
+
+function tp_err(p: player, body: text):
+    send "%tpfx()%<red>%{_body}%" to {_p}
+    tp_sound({_p}, "block.note_block.bass", 0.7)
+
+function tp_sound(p: player, id: text, pitch: number):
+    if {tp::cfg::sounds} is true:
+        play sound {_id} with volume 0.6 with pitch {_pitch} to {_p}
+
+function tp_title(p: player, top: text, sub: text, secs: number):
+    if {tp::cfg::titles} is true:
+        send title {_top} with subtitle {_sub} to {_p} for {_secs} seconds
+
+
+# ============================================================================
+#  COOLDOWNS
+#  Absolute unix deadlines, not counters. Survives restarts, survives the
+#  server clock being the only thing anyone trusts.
+# ============================================================================
+
+function tp_cd_set(p: player, key: text, seconds: number):
+    if {_seconds} > 0:
+        set {tp::cd::%uuid of {_p}%::%{_key}%} to tp_now() + {_seconds}
+
+function tp_cd_left(p: player, key: text) :: number:
+    set {_t} to {tp::cd::%uuid of {_p}%::%{_key}%}
+    if {_t} is not set:
+        return 0
+    return max(0, {_t} - tp_now())
+
+# Returns true if the player may proceed. Complains for you if not.
+function tp_cd_ready(p: player, key: text) :: boolean:
+    if {_p} has permission "teleport.bypass.cooldown":
+        return true
+    set {_l} to tp_cd_left({_p}, {_key})
+    if {_l} > 0:
+        tp_err({_p}, "Wait <yellow>%tp_dur({_l})%<red> before doing that again.")
+        return false
+    return true
+
+
+# ============================================================================
+#  PAYMENT
+#  Uses the Vault balance directly. If you are running the Ducat economy,
+#  swap the `remove ... from balance` line for charge({_p}, {_amount},
+#  {_reason}) so teleport fees show up in /ecoadmin burns instead of
+#  quietly vanishing.
+# ============================================================================
+
+function tp_charge(p: player, amount: number, reason: text) :: boolean:
+    if {_amount} <= 0:
+        return true
+    if {_p} has permission "teleport.bypass.cost":
+        return true
+    if {_p}'s balance < {_amount}:
+        tp_err({_p}, "That costs <yellow>%tp_comma({_amount})%<red>, you have <yellow>%tp_comma({_p}'s balance)%<red>.")
+        return false
+    remove {_amount} from {_p}'s balance
+    return true
+
+
+# ============================================================================
+#  THE WARMUP ENGINE
+#
+#  One implementation for both systems. A warmup is identified by a token
+#  (the unix time it started). Cancelling is a delete, so the loop notices
+#  on its next quarter-second tick and simply stops -- there is no flag to
+#  get stuck true and no second teleport to race.
+#
+#  `follow` is a UUID string, or "". When set, the destination is resolved
+#  from that player's CURRENT location at the moment the countdown ends,
+#  not where they stood when it began. That is what makes /tpaccept feel
+#  right when the other person is walking.
+# ============================================================================
+
+function tp_warm_cancel(p: player, why: text):
+    if {tp::warm::%uuid of {_p}%} is set:
+        delete {tp::warm::%uuid of {_p}%}
+        # An /rtp countdown has already taken the cooldown and the fee, and
+        # has markers set that make the next /rtp refuse. Cancelling the
+        # warmup without unwinding all three locks the player out until they
+        # relog. rtp_abort() is a no-op for any other kind of teleport.
+        rtp_abort({_p})
+        tp_err({_p}, "Teleport cancelled <dark_gray>(%{_why}%)")
+
+function tp_warming(p: player) :: boolean:
+    if {tp::warm::%uuid of {_p}%} is set:
+        return true
+    return false
+
+function tp_warmup(p: player, dest: location, follow: text, label: text, tag: text):
+    set {_id} to "%uuid of {_p}%"
+    set {_secs} to {tp::cfg::%{_tag}%_warmup} ? 0
+    if {_p} has permission "teleport.bypass.warmup":
+        set {_secs} to 0
+
+    if {_secs} <= 0:
+        tp_land({_p}, {_dest}, {_follow}, {_label}, {_tag})
+        stop
+
+    set {_token} to tp_now()
+    set {tp::warm::%{_id}%} to {_token}
+    set {_start} to location of {_p}
+    set {_steps} to round({_secs} * 4)
+
+    tp_sound({_p}, "block.note_block.hat", 1.2)
+    loop {_steps} times:
+        wait 5 ticks
+        if {tp::warm::%{_id}%} is not {_token}:
+            stop
+        if {_p} is not online:
+            delete {tp::warm::%{_id}%}
+            stop
+
+        if {tp::cfg::cancel_on_move} is true:
+            if world of {_p} is not world of {_start}:
+                tp_warm_cancel({_p}, "you changed world")
+                stop
+            if distance between location of {_p} and {_start} > {tp::cfg::move_tolerance}:
+                tp_warm_cancel({_p}, "you moved")
+                stop
+
+        set {_left} to ({_steps} - loop-value) / 4
+        set {_frac} to loop-value / {_steps}
+        set {_meter} to tp_bar({_frac}, 20, "<aqua>")
+        send action bar "<gray>%{_label}% <dark_gray>| %{_meter}% <dark_gray>| <white>%tp_r({_left}, 1)%s" to {_p}
+        if mod(loop-value, 4) is 0:
+            tp_sound({_p}, "block.note_block.hat", 1 + ({_frac} * 0.6))
+
+    if {tp::warm::%{_id}%} is not {_token}:
+        stop
+    delete {tp::warm::%{_id}%}
+    tp_land({_p}, {_dest}, {_follow}, {_label}, {_tag})
+
+
+# The actual move. Everything that must happen exactly once per teleport
+# lives here: back location, fall immunity, sound, and the per-system
+# arrival hook.
+function tp_land(p: player, dest: location, follow: text, label: text, tag: text):
+    # /rtp has no destination when its countdown starts -- finding one is
+    # what happens next, and it needs the player to do it. 03-rtp takes over.
+    if {_tag} is "rtp":
+        if {rtp::pend::w::%uuid of {_p}%} is set:
+            rtp_search({_p})
+            stop
+
+    set {_to} to {_dest}
+    if {_follow} is not "":
+        set {_found} to false
+        loop all players:
+            if "%uuid of loop-player%" is {_follow}:
+                set {_to} to location of loop-player
+                set {_found} to true
+                exit loop
+        if {_found} is false:
+            tp_err({_p}, "They went offline. Teleport aborted.")
+            stop
+
+    if {tp::cfg::back_enabled} is true:
+        set {tp::back::%uuid of {_p}%} to location of {_p}
+
+    set {tp::nofall::%uuid of {_p}%} to tp_now() + ({tp::cfg::nofall} ? 0)
+    tp_sound({_p}, "entity.enderman.teleport", 1)
+    teleport {_p} to {_to}
+    set {_p}'s fall distance to 0
+    tp_sound({_p}, "entity.enderman.teleport", 1.2)
+    tp_arrive({_p}, {_tag}, {_label})
+
+
+# Per-system arrival flourish. Add a branch here if you bolt on another
+# teleport source later -- warps, homes, an arena queue.
+function tp_arrive(p: player, tag: text, label: text):
+    if {_tag} is "rtp":
+        rtp_arrive({_p})
+    else:
+        tp_title({_p}, "<aqua>Arrived", "<gray>%{_label}%", 2)
+
+
+# ---------------------------------------------------------------------------
+#  WARMUP INTERRUPTS
+# ---------------------------------------------------------------------------
+
+on damage:
+    victim is a player
+    if {tp::cfg::cancel_on_damage} is true:
+        tp_warm_cancel(victim, "you took damage")
+
+on damage:
+    victim is a player
+    damage cause is fall
+    set {_t} to {tp::nofall::%uuid of victim%}
+    {_t} is set
+    if {_t} > tp_now():
+        cancel event
+    else:
+        delete {tp::nofall::%uuid of victim%}
+
+on quit:
+    delete {tp::warm::%uuid of player%}
+    delete {tp::nofall::%uuid of player%}
+    delete {tpui::mode::%uuid of player%}
+    delete {tpui::busy::%uuid of player%}
+
+
+# ---------------------------------------------------------------------------
+#  /tpback
+#  Deliberately NOT /back -- EssentialsX owns that name and fighting it over
+#  command registration is a losing game. See the README.
+# ---------------------------------------------------------------------------
+
+command /tpback:
+    aliases: /tpb
+    permission: teleport.back
+    permission message: <red>You don't have access to that.
+    executable by: players
+    trigger:
+        if {tp::cfg::back_enabled} is false:
+            tp_err(player, "Return teleports are disabled.")
+            stop
+        set {_l} to {tp::back::%uuid of player%}
+        if {_l} is not set:
+            tp_err(player, "Nowhere to go back to yet.")
+            stop
+        if tp_cd_ready(player, "back") is false:
+            stop
+        tp_cd_set(player, "back", 10)
+        tp_warmup(player, {_l}, "", "Returning to %tp_where({_l})%", "tpa")
+
+
+# ============================================================================
+#  CHEST-UI TOOLKIT
+#
+#  Lore is always passed as a list variable. Skript's multiline continuation
+#  syntax varies between versions; building a list first always works.
+# ============================================================================
+
+function tpui_set(inv: inventory, slot: integer, item: item, name: text, lore: texts):
+    set slot {_slot} of {_inv} to {_item} named {_name} with lore {_lore::*}
+
+function tpui_flat(inv: inventory, slot: integer, item: item, name: text):
+    clear {_none::*}
+    set slot {_slot} of {_inv} to {_item} named {_name} with lore {_none::*}
+
+function tpui_fill(inv: inventory, from: integer, to: integer, item: item):
+    loop ({_to} - {_from} + 1) times:
+        tpui_flat({_inv}, {_from} + loop-value - 1, {_item}, "<!italic><dark_gray>")
+
+function tpui_frame(inv: inventory, rows: integer):
+    tpui_fill({_inv}, 0, ({_rows} * 9) - 1, black stained glass pane)
+
+function tpui_head(p: offline player) :: item:
+    return {_p}'s skull
+
+
+# ---------------------------------------------------------------------------
+#  GUI OWNERSHIP
+#
+#  Bukkit fires InventoryCloseEvent for the currently-open container while
+#  you are inside openInventory() -- including the player's own default
+#  inventory view. So a naive "set flag, then open, and clear the flag on
+#  close" pattern deletes its own flag every single time, and every click
+#  sails past the guard uncancelled.
+#
+#  tpui_open() sets a busy marker around the open call, and the close
+#  handler ignores any close that happens while busy. One shared mode
+#  variable, so menus can hand off to each other without stomping.
+#
+#  ALWAYS open menus through tpui_open(). Never call `open ... to player`
+#  directly for a menu, or you lose click protection.
+# ---------------------------------------------------------------------------
+
+function tpui_open(p: player, inv: inventory, mode: text):
+    set {tpui::busy::%uuid of {_p}%} to true
+    open {_inv} to {_p}
+    set {tpui::mode::%uuid of {_p}%} to {_mode}
+    delete {tpui::busy::%uuid of {_p}%}
+
+function tpui_mode(p: player) :: text:
+    return {tpui::mode::%uuid of {_p}%} ? ""
+
+function tpui_page(p: player) :: integer:
+    return {tpui::page::%uuid of {_p}%} ? 1
+
+
+# ---------------------------------------------------------------------------
+#  SLOT MAPS
+#
+#  A head in slot 21 has to resolve back to a UUID on click, and a biome
+#  button back to a profile key. Rather than parse it out of the item name
+#  -- which breaks the moment someone has a colour code in their nick --
+#  each draw writes {tpui::map::<uuid>::<slot>} and the click handler reads
+#  it back. Cleared at the top of every draw, so a stale map can never fire
+#  a teleport at the wrong person.
+# ---------------------------------------------------------------------------
+
+function tpui_map_clear(p: player):
+    delete {tpui::map::%uuid of {_p}%::*}
+
+function tpui_map(p: player, slot: integer, value: text):
+    set {tpui::map::%uuid of {_p}%::%{_slot}%} to {_value}
+
+function tpui_mapped(p: player, slot: integer) :: text:
+    return {tpui::map::%uuid of {_p}%::%{_slot}%} ? ""
+
+# "%click type%" rather than a click-type comparison, because the name of
+# that expression has moved around between Skript versions and a substring
+# test survives all of them.
+function tpui_right(t: text) :: boolean:
+    if {_t} contains "right":
+        return true
+    return false
+
+function tpui_shift(t: text) :: boolean:
+    if {_t} contains "shift":
+        return true
+    return false
+
+on inventory close:
+    if {tpui::busy::%uuid of player%} is set:
+        stop
+    delete {tpui::mode::%uuid of player%}
+
+# Dragging is a separate event from clicking. Without this, players can
+# drag-distribute items across the menu and pull things straight out.
+on inventory drag:
+    if tpui_mode(player) is not "":
+        cancel event

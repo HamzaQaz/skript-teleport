@@ -1,0 +1,505 @@
+# ============================================================================
+#  TELEPORT SUITE  ·  02-tpa-gui
+#  The chest UI.  /tpa with no arguments.
+#
+#    tpa.hub    inbox, outbox, and the way into everything else
+#    tpa.pick   paginated player picker, near players first
+#    tpa.set    per-player preferences
+#    tpa.block  block list, click a head to unblock
+#
+#  Every button here calls a function from 01-tpa. The menu holds no rules
+#  of its own -- if a click is refused, it is refused for the same reason
+#  and with the same message the command would have given.
+#
+#  Slot-to-UUID mapping and the click-type helpers live in 00-core.
+# ============================================================================
+
+
+# ============================================================================
+#  HUB
+# ============================================================================
+
+function tpa_hub(p: player):
+    set {_id} to tpa_key({_p})
+    tpui_map_clear({_p})
+
+    set {_inv} to chest inventory with 6 rows named "<dark_gray>▌ <aqua>Teleport"
+    tpui_frame({_inv}, 6)
+    tpui_fill({_inv}, 27, 35, gray stained glass pane)
+
+    set {_in} to tpa_count_in({_id})
+    set {_out} to tpa_count_out({_id})
+
+    # ---- ROW 1 : you ------------------------------------------------------
+    clear {_l::*}
+    if tpa_accepting({_p}) is true:
+        add "<!italic><gray>Status <green>accepting requests" to {_l::*}
+    else:
+        add "<!italic><gray>Status <red>do not disturb" to {_l::*}
+    add "<!italic><gray>Incoming <white>%{_in}%<gray> · Outgoing <white>%{_out}%<gray>/%{tp::cfg::tpa_max_out}%" to {_l::*}
+    add "" to {_l::*}
+    add "<!italic><gray>You are at %tp_where(location of {_p})%" to {_l::*}
+    set {_cd} to tp_cd_left({_p}, "tpa")
+    if {_cd} > 0:
+        add "<!italic><gray>Next request in <yellow>%tp_dur({_cd})%" to {_l::*}
+    add "" to {_l::*}
+    add "<!italic><yellow>Click to toggle do-not-disturb." to {_l::*}
+    tpui_set({_inv}, 4, tpui_head({_p}), "<!italic><aqua><bold>%{_p}%", {_l::*})
+
+    # ---- ROW 2 : incoming -------------------------------------------------
+    clear {_l::*}
+    add "<!italic><gray>People waiting on your answer." to {_l::*}
+    add "" to {_l::*}
+    add "<!italic><green>Left click <gray>accept" to {_l::*}
+    add "<!italic><red>Right click <gray>deny" to {_l::*}
+    tpui_set({_inv}, 9, lime stained glass pane, "<!italic><green><bold>INCOMING <dark_gray>(%{_in}%)", {_l::*})
+
+    set {_s} to 10
+    loop {tpa::in::%{_id}%::*}:
+        if {_s} > 16:
+            exit loop
+        set {_sid} to loop-index
+        set {_type} to {tpa::r::%{_sid}%::%{_id}%::type} ? "to"
+        set {_name} to {tpa::r::%{_sid}%::%{_id}%::sname} ? "?"
+        set {_left} to tpa_left({_sid}, {_id})
+
+        clear {_l::*}
+        if {_type} is "to":
+            add "<!italic><gray>Wants to teleport <white>to you" to {_l::*}
+        else:
+            add "<!italic><gray>Wants <white>you to go to them" to {_l::*}
+        set {_other} to tpa_online({_sid})
+        if {_other} is set:
+            add "<!italic><gray>At %tp_where(location of {_other})%" to {_l::*}
+            if world of {_other} is world of {_p}:
+                add "<!italic><gray>Distance <white>%tp_comma(distance between {_p} and {_other})%<gray> blocks" to {_l::*}
+            else:
+                add "<!italic><yellow>Different world" to {_l::*}
+            set {_item} to tpui_head({_other})
+        else:
+            add "<!italic><red>Offline" to {_l::*}
+            set {_item} to player head
+        add "" to {_l::*}
+        add "<!italic><gray>Expires in <white>%tp_dur({_left})%" to {_l::*}
+        set {_meter} to tp_bar({_left} / {tp::cfg::tpa_expire}, 14, "<aqua>")
+        add "<!italic>%{_meter}%" to {_l::*}
+        add "" to {_l::*}
+        add "<!italic><green>Left click to accept" to {_l::*}
+        add "<!italic><red>Right click to deny" to {_l::*}
+        tpui_set({_inv}, {_s}, {_item}, "<!italic><white><bold>%{_name}%", {_l::*})
+        tpui_map({_p}, {_s}, {_sid})
+        add 1 to {_s}
+
+    if {_in} > 0:
+        clear {_l::*}
+        add "<!italic><gray>Turns down everyone currently" to {_l::*}
+        add "<!italic><gray>waiting. They are told." to {_l::*}
+        tpui_set({_inv}, 17, red dye, "<!italic><red>Deny all", {_l::*})
+
+    # ---- ROW 3 : outgoing -------------------------------------------------
+    clear {_l::*}
+    add "<!italic><gray>Requests you have sent out." to {_l::*}
+    add "" to {_l::*}
+    add "<!italic><gray>Click one to withdraw it." to {_l::*}
+    tpui_set({_inv}, 18, orange stained glass pane, "<!italic><gold><bold>OUTGOING <dark_gray>(%{_out}%)", {_l::*})
+
+    set {_s} to 19
+    loop {tpa::out::%{_id}%::*}:
+        if {_s} > 25:
+            exit loop
+        set {_tid} to loop-index
+        set {_type} to {tpa::r::%{_id}%::%{_tid}%::type} ? "to"
+        set {_name} to {tpa::r::%{_id}%::%{_tid}%::tname} ? "?"
+        set {_left} to tpa_left({_id}, {_tid})
+
+        clear {_l::*}
+        if {_type} is "to":
+            add "<!italic><gray>You asked to go <white>to them" to {_l::*}
+        else:
+            add "<!italic><gray>You asked them to <white>come here" to {_l::*}
+        add "" to {_l::*}
+        add "<!italic><gray>Expires in <white>%tp_dur({_left})%" to {_l::*}
+        set {_meter} to tp_bar({_left} / {tp::cfg::tpa_expire}, 14, "<gold>")
+        add "<!italic>%{_meter}%" to {_l::*}
+        add "" to {_l::*}
+        add "<!italic><yellow>Click to withdraw." to {_l::*}
+        set {_other} to tpa_online({_tid})
+        if {_other} is set:
+            set {_item} to tpui_head({_other})
+        else:
+            set {_item} to player head
+        tpui_set({_inv}, {_s}, {_item}, "<!italic><gold>%{_name}%", {_l::*})
+        tpui_map({_p}, {_s}, {_tid})
+        add 1 to {_s}
+
+    if {_out} > 0:
+        clear {_l::*}
+        add "<!italic><gray>Withdraws every request you" to {_l::*}
+        add "<!italic><gray>currently have out." to {_l::*}
+        tpui_set({_inv}, 26, gray dye, "<!italic><yellow>Cancel all", {_l::*})
+
+    # ---- ROW 5 : navigation ----------------------------------------------
+    clear {_l::*}
+    add "<!italic><gray>Every player online, nearest first." to {_l::*}
+    add "" to {_l::*}
+    if tpa_picktype({_p}) is "to":
+        add "<!italic><gray>Clicking a head sends <white>/tpa" to {_l::*}
+    else:
+        add "<!italic><gray>Clicking a head sends <white>/tpahere" to {_l::*}
+    add "<!italic><dark_gray>Right click a head for the other one." to {_l::*}
+    tpui_set({_inv}, 38, ender pearl, "<!italic><aqua><bold>FIND A PLAYER", {_l::*})
+
+    clear {_l::*}
+    add "<!italic><gray>Do-not-disturb, sounds, and what a" to {_l::*}
+    add "<!italic><gray>left click means." to {_l::*}
+    tpui_set({_inv}, 40, comparator, "<!italic><aqua><bold>SETTINGS", {_l::*})
+
+    clear {_l::*}
+    add "<!italic><gray>Blocked <white>%size of {tpa::block::%{_id}%::*}%<gray> player(s)" to {_l::*}
+    add "" to {_l::*}
+    add "<!italic><dark_gray>Blocked players are told the same" to {_l::*}
+    add "<!italic><dark_gray>thing as everyone with DND on." to {_l::*}
+    tpui_set({_inv}, 42, iron bars, "<!italic><aqua><bold>BLOCK LIST", {_l::*})
+
+    # ---- ROW 6 -----------------------------------------------------------
+    clear {_l::*}
+    add "<!italic><gray>A request lasts <white>%tp_dur({tp::cfg::tpa_expire})%<gray> and" to {_l::*}
+    add "<!italic><gray>either side can withdraw it." to {_l::*}
+    add "" to {_l::*}
+    if {tp::cfg::tpa_warmup} > 0:
+        add "<!italic><gray>After accepting there is a <white>%{tp::cfg::tpa_warmup}%s<gray>" to {_l::*}
+        add "<!italic><gray>countdown. Moving cancels it." to {_l::*}
+    else:
+        add "<!italic><gray>Accepted teleports are instant." to {_l::*}
+    if {tp::cfg::tpa_cost} > 0:
+        add "" to {_l::*}
+        add "<!italic><gray>Cost <white>%tp_comma({tp::cfg::tpa_cost})%<gray>, paid by whoever moves." to {_l::*}
+    add "" to {_l::*}
+    add "<!italic><dark_gray>/tpa · /tpahere · /tpaccept · /tpdeny" to {_l::*}
+    add "<!italic><dark_gray>/tpacancel · /tpatoggle · /tpablock" to {_l::*}
+    tpui_set({_inv}, 45, book, "<!italic><aqua><bold>HOW THIS WORKS", {_l::*})
+
+    clear {_l::*}
+    add "<!italic><gray>Redraws with current timers." to {_l::*}
+    tpui_set({_inv}, 49, sunflower, "<!italic><green>Refresh", {_l::*})
+
+    tpui_flat({_inv}, 53, barrier, "<!italic><red>Close")
+    tpui_open({_p}, {_inv}, "tpa.hub")
+
+
+# ============================================================================
+#  PLAYER PICKER
+#  Same-world players first, then everyone else. Both groups keep the
+#  server's own ordering -- a full distance sort of 100+ players every
+#  redraw costs more than it is worth, and "who is in my world" is the
+#  part people actually care about.
+# ============================================================================
+
+function tpa_pick(p: player):
+    set {_id} to tpa_key({_p})
+    tpui_map_clear({_p})
+
+    clear {_near::*}
+    clear {_far::*}
+    loop all players:
+        if loop-player is not {_p}:
+            if world of loop-player is world of {_p}:
+                add loop-player to {_near::*}
+            else:
+                add loop-player to {_far::*}
+    clear {_all::*}
+    add {_near::*} to {_all::*}
+    add {_far::*} to {_all::*}
+
+    set {_total} to size of {_all::*}
+    set {_per} to 45
+    set {_pages} to max(1, ceil({_total} / {_per}))
+    set {_page} to max(1, min(tpui_page({_p}), {_pages}))
+    set {tpui::page::%{_id}%} to {_page}
+
+    set {_inv} to chest inventory with 6 rows named "<dark_gray>▌ <aqua>Players <dark_gray>%{_page}%/%{_pages}%"
+    tpui_fill({_inv}, 45, 53, black stained glass pane)
+
+    set {_first} to (({_page} - 1) * {_per}) + 1
+    set {_s} to 0
+    set {_n} to 0
+    loop {_all::*}:
+        add 1 to {_n}
+        if {_n} >= {_first}:
+            if {_s} <= 44:
+                set {_o} to loop-value
+                set {_oid} to tpa_key({_o})
+
+                clear {_l::*}
+                add "<!italic><gray>%tp_where(location of {_o})%" to {_l::*}
+                if world of {_o} is world of {_p}:
+                    add "<!italic><gray>Distance <white>%tp_comma(distance between {_p} and {_o})%<gray> blocks" to {_l::*}
+                else:
+                    add "<!italic><yellow>Another world" to {_l::*}
+                add "" to {_l::*}
+
+                set {_ok} to true
+                if tpa_accepting({_o}) is false:
+                    add "<!italic><red>Not accepting requests" to {_l::*}
+                    set {_ok} to false
+                if tpa_blocked({_oid}, {_id}) is true:
+                    add "<!italic><red>Not accepting requests" to {_l::*}
+                    set {_ok} to false
+                if tpa_has({_id}, {_oid}) is true:
+                    add "<!italic><yellow>Request already pending" to {_l::*}
+                    set {_ok} to false
+
+                if {_ok} is true:
+                    if tpa_picktype({_p}) is "to":
+                        add "<!italic><green>Left click <gray>ask to go to them" to {_l::*}
+                        add "<!italic><aqua>Right click <gray>ask them to come here" to {_l::*}
+                    else:
+                        add "<!italic><green>Left click <gray>ask them to come here" to {_l::*}
+                        add "<!italic><aqua>Right click <gray>ask to go to them" to {_l::*}
+                    set {_item} to tpui_head({_o})
+                    set {_col} to "<white>"
+                else:
+                    set {_item} to gray dye
+                    set {_col} to "<dark_gray>"
+
+                tpui_set({_inv}, {_s}, {_item}, "<!italic>%{_col}%%{_o}%", {_l::*})
+                tpui_map({_p}, {_s}, {_oid})
+                add 1 to {_s}
+
+    if {_total} is 0:
+        clear {_l::*}
+        add "<!italic><gray>Nobody else is online." to {_l::*}
+        tpui_set({_inv}, 22, barrier, "<!italic><red>Empty server", {_l::*})
+
+    if {_page} > 1:
+        tpui_flat({_inv}, 45, arrow, "<!italic><yellow>Previous page")
+    if {_page} < {_pages}:
+        tpui_flat({_inv}, 53, arrow, "<!italic><yellow>Next page")
+
+    clear {_l::*}
+    add "<!italic><gray>%{_total}%<gray> player(s) online besides you." to {_l::*}
+    add "<!italic><gray>Page <white>%{_page}%<gray> of <white>%{_pages}%" to {_l::*}
+    tpui_set({_inv}, 49, paper, "<!italic><aqua>Page %{_page}%/%{_pages}%", {_l::*})
+
+    tpui_flat({_inv}, 48, sunflower, "<!italic><green>Refresh")
+    tpui_flat({_inv}, 50, oak door, "<!italic><yellow>Back")
+    tpui_open({_p}, {_inv}, "tpa.pick")
+
+
+# ============================================================================
+#  SETTINGS
+# ============================================================================
+
+function tpa_settings(p: player):
+    set {_id} to tpa_key({_p})
+    set {_inv} to chest inventory with 3 rows named "<dark_gray>▌ <aqua>Teleport settings"
+    tpui_frame({_inv}, 3)
+
+    clear {_l::*}
+    if tpa_accepting({_p}) is true:
+        add "<!italic><green>Anyone may send you a request." to {_l::*}
+        set {_i} to lime dye
+        set {_n} to "<green>Accepting requests"
+    else:
+        add "<!italic><red>All requests are refused on arrival." to {_l::*}
+        add "<!italic><gray>Senders are not told it is personal." to {_l::*}
+        set {_i} to red dye
+        set {_n} to "<red>Do not disturb"
+    add "" to {_l::*}
+    add "<!italic><yellow>Click to switch." to {_l::*}
+    tpui_set({_inv}, 10, {_i}, "<!italic><!bold>%{_n}%", {_l::*})
+
+    clear {_l::*}
+    if tpa_picktype({_p}) is "to":
+        add "<!italic><white>You travel to them <dark_gray>(/tpa)" to {_l::*}
+    else:
+        add "<!italic><white>They travel to you <dark_gray>(/tpahere)" to {_l::*}
+    add "" to {_l::*}
+    add "<!italic><gray>What a left click in the player" to {_l::*}
+    add "<!italic><gray>picker means. Right click always" to {_l::*}
+    add "<!italic><gray>does the other one." to {_l::*}
+    add "" to {_l::*}
+    add "<!italic><yellow>Click to switch." to {_l::*}
+    tpui_set({_inv}, 12, ender pearl, "<!italic><aqua><bold>DEFAULT REQUEST", {_l::*})
+
+    clear {_l::*}
+    add "<!italic><gray>Blocked <white>%size of {tpa::block::%{_id}%::*}%<gray> player(s)" to {_l::*}
+    add "" to {_l::*}
+    add "<!italic><yellow>Click to review." to {_l::*}
+    tpui_set({_inv}, 14, iron bars, "<!italic><aqua><bold>BLOCK LIST", {_l::*})
+
+    clear {_l::*}
+    add "<!italic><gray>Warmup <white>%{tp::cfg::tpa_warmup}%s<gray> · expiry <white>%tp_dur({tp::cfg::tpa_expire})%" to {_l::*}
+    add "<!italic><gray>Cooldown <white>%tp_dur({tp::cfg::tpa_cooldown})%<gray> between sends" to {_l::*}
+    if {tp::cfg::tpa_cross_world} is true:
+        add "<!italic><gray>Cross-world <green>allowed" to {_l::*}
+    else:
+        add "<!italic><gray>Cross-world <red>blocked" to {_l::*}
+    add "" to {_l::*}
+    add "<!italic><dark_gray>Server-wide. Staff change these with" to {_l::*}
+    add "<!italic><dark_gray>/tpadmin config." to {_l::*}
+    tpui_set({_inv}, 16, clock, "<!italic><gold><bold>SERVER RULES", {_l::*})
+
+    tpui_flat({_inv}, 22, oak door, "<!italic><yellow>Back")
+    tpui_open({_p}, {_inv}, "tpa.set")
+
+
+# ============================================================================
+#  BLOCK LIST
+#  Generic heads on purpose: turning a stored UUID back into an OfflinePlayer
+#  just to skin a head is a blocking lookup for someone who may never have
+#  been on this server. The name was cached when they were blocked.
+# ============================================================================
+
+function tpa_block_menu(p: player):
+    set {_id} to tpa_key({_p})
+    tpui_map_clear({_p})
+
+    set {_inv} to chest inventory with 6 rows named "<dark_gray>▌ <aqua>Blocked players"
+    tpui_fill({_inv}, 45, 53, black stained glass pane)
+
+    set {_s} to 0
+    loop {tpa::block::%{_id}%::*}:
+        if {_s} > 44:
+            exit loop
+        clear {_l::*}
+        add "<!italic><gray>Cannot send you teleport requests." to {_l::*}
+        add "" to {_l::*}
+        add "<!italic><yellow>Click to unblock." to {_l::*}
+        tpui_set({_inv}, {_s}, player head, "<!italic><red>%loop-value%", {_l::*})
+        tpui_map({_p}, {_s}, loop-index)
+        add 1 to {_s}
+
+    if {_s} is 0:
+        clear {_l::*}
+        add "<!italic><gray>You haven't blocked anyone." to {_l::*}
+        add "" to {_l::*}
+        add "<!italic><dark_gray>/tpablock <player>" to {_l::*}
+        tpui_set({_inv}, 22, lime stained glass pane, "<!italic><green>Nobody blocked", {_l::*})
+
+    tpui_flat({_inv}, 49, oak door, "<!italic><yellow>Back")
+    tpui_flat({_inv}, 53, barrier, "<!italic><red>Close")
+    tpui_open({_p}, {_inv}, "tpa.block")
+
+
+# ============================================================================
+#  CLICKS
+# ============================================================================
+
+on inventory click:
+    set {_m} to tpui_mode(player)
+    {_m} is "tpa.hub" or "tpa.pick" or "tpa.set" or "tpa.block"
+    cancel event
+    clicked inventory is event-inventory
+    set {_p} to player
+    set {_id} to tpa_key({_p})
+    set {_s} to index of event-slot
+    set {_ct} to "%click type%" in lower case
+    set {_target} to tpui_mapped({_p}, {_s})
+
+    # ---- HUB --------------------------------------------------------------
+    if {_m} is "tpa.hub":
+        if {_s} is 4:
+            tpa_dnd_flip({_p})
+            if tpa_accepting({_p}) is true:
+                tp_ok({_p}, "Now accepting teleport requests.")
+            else:
+                tp_msg({_p}, "<yellow>Do not disturb is on.")
+            tpa_hub({_p})
+
+        else if {_s} is between 10 and 16:
+            if {_target} is not "":
+                if tpui_right({_ct}) is true:
+                    tpa_deny({_p}, {_target})
+                    tpa_hub({_p})
+                else:
+                    tpa_accept({_p}, {_target})
+                    close {_p}'s inventory
+
+        else if {_s} is 17:
+            set {_n} to tpa_deny_all({_p})
+            if {_n} > 0:
+                tp_msg({_p}, "<gray>Denied <white>%{_n}%<gray> request(s).")
+            tpa_hub({_p})
+
+        else if {_s} is between 19 and 25:
+            if {_target} is not "":
+                tpa_cancel({_p}, {_target})
+                tpa_hub({_p})
+
+        else if {_s} is 26:
+            clear {_ids::*}
+            loop {tpa::out::%{_id}%::*}:
+                add loop-index to {_ids::*}
+            loop {_ids::*}:
+                tpa_cancel({_p}, loop-value)
+            tpa_hub({_p})
+
+        else if {_s} is 38:
+            set {tpui::page::%{_id}%} to 1
+            tpa_pick({_p})
+        else if {_s} is 40:
+            tpa_settings({_p})
+        else if {_s} is 42:
+            tpa_block_menu({_p})
+        else if {_s} is 49:
+            tpa_hub({_p})
+        else if {_s} is 53:
+            close {_p}'s inventory
+
+    # ---- PICKER -----------------------------------------------------------
+    else if {_m} is "tpa.pick":
+        if {_s} is 45:
+            set {tpui::page::%{_id}%} to max(1, tpui_page({_p}) - 1)
+            tpa_pick({_p})
+        else if {_s} is 53:
+            set {tpui::page::%{_id}%} to tpui_page({_p}) + 1
+            tpa_pick({_p})
+        else if {_s} is 48:
+            tpa_pick({_p})
+        else if {_s} is 50:
+            tpa_hub({_p})
+        else if {_s} is 49:
+            # page counter, not a button
+            stop
+        else if {_target} is not "":
+            set {_o} to tpa_online({_target})
+            if {_o} is not set:
+                tp_err({_p}, "They just went offline.")
+                tpa_pick({_p})
+                stop
+            set {_type} to tpa_picktype({_p})
+            if tpui_right({_ct}) is true:
+                if {_type} is "to":
+                    set {_type} to "here"
+                else:
+                    set {_type} to "to"
+            if tpa_send({_p}, {_o}, {_type}) is true:
+                tpa_hub({_p})
+            else:
+                tpa_pick({_p})
+
+    # ---- SETTINGS ---------------------------------------------------------
+    else if {_m} is "tpa.set":
+        if {_s} is 10:
+            tpa_dnd_flip({_p})
+            tpa_settings({_p})
+        else if {_s} is 12:
+            tpa_picktype_flip({_p})
+            tpa_settings({_p})
+        else if {_s} is 14:
+            tpa_block_menu({_p})
+        else if {_s} is 22:
+            tpa_hub({_p})
+
+    # ---- BLOCK LIST -------------------------------------------------------
+    else if {_m} is "tpa.block":
+        if {_s} is 49:
+            tpa_hub({_p})
+        else if {_s} is 53:
+            close {_p}'s inventory
+        else if {_target} is not "":
+            set {_name} to {tpa::block::%{_id}%::%{_target}%} ? "them"
+            delete {tpa::block::%{_id}%::%{_target}%}
+            tp_ok({_p}, "Unblocked <white>%{_name}%<green>.")
+            tpa_block_menu({_p})

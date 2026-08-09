@@ -1,0 +1,135 @@
+# ============================================================================
+#  TELEPORT SUITE  ·  05-admin
+#  Staff tooling.  /tpadmin and /rtpadmin
+#
+#  Config lives in variables, not in this file, so nothing here needs a
+#  reload to take effect. The one exception is the seeded default set --
+#  /tpadmin config reset wipes {tp::cfg::*} and re-runs both seeders.
+# ============================================================================
+
+command /tpadmin [<text>] [<text>] [<text>]:
+    permission: teleport.admin
+    permission message: <red>No.
+    trigger:
+        set {_a} to (arg-1 ? "help") in lower case
+
+        if {_a} is "info":
+            set {_pend} to 0
+            loop {tpa::out::*}:
+                add size of {tpa::out::%loop-index%::*} to {_pend}
+            send "%tpfx()%<gray>Pending requests <white>%{_pend}%"
+            send "%tpfx()%<gray>Warmup <white>%{tp::cfg::tpa_warmup}%s<gray> · expiry <white>%tp_dur({tp::cfg::tpa_expire})%<gray> · cooldown <white>%tp_dur({tp::cfg::tpa_cooldown})%"
+            send "%tpfx()%<gray>RTP cooldown <white>%tp_dur({tp::cfg::rtp_cooldown})%<gray> · warmup <white>%{tp::cfg::rtp_warmup}%s<gray> · cost <white>%tp_comma({tp::cfg::rtp_cost})%"
+            send "%tpfx()%<gray>RTP rings <white>0-%tp_comma({tp::cfg::rtp_near_max})%<gray> and <white>%tp_comma({tp::cfg::rtp_far_min})%-%tp_comma({tp::cfg::rtp_far_max})%"
+
+        else if {_a} is "config":
+            set {_b} to (arg-2 ? "") in lower case
+            if {_b} is "reset":
+                delete {tp::cfg::*}
+                tp_seed()
+                rtp_seed()
+                send "%tpfx()%<red>Config wiped and reseeded."
+            else if {_b} is "" or "list":
+                send "%tpfx()%<gray>Config keys:"
+                # Nested trees ({tp::cfg::rtp::w::*} and friends) have no
+                # value of their own, so they fall out here rather than
+                # printing a row of blanks. Those are edited via /rtpadmin.
+                loop {tp::cfg::*}:
+                    if loop-value is set:
+                        send "<dark_gray> · <gray>%loop-index% <dark_gray>= <white>%loop-value%"
+                send "%tpfx()%<dark_gray>/tpadmin config <key> <value>"
+            else:
+                if arg-3 is not set:
+                    send "%tpfx()%<gray>%{_b}% <dark_gray>= <white>%{tp::cfg::%{_b}%}%"
+                else:
+                    set {_v} to arg-3
+                    if {_v} is "true":
+                        set {tp::cfg::%{_b}%} to true
+                    else if {_v} is "false":
+                        set {tp::cfg::%{_b}%} to false
+                    else if ({_v} parsed as number) is set:
+                        set {tp::cfg::%{_b}%} to {_v} parsed as number
+                    else:
+                        set {tp::cfg::%{_b}%} to {_v}
+                    send "%tpfx()%<green>%{_b}% <gray>= <white>%{tp::cfg::%{_b}%}%"
+
+        else if {_a} is "requests":
+            set {_n} to 0
+            loop {tpa::out::*}:
+                set {_sid} to loop-index
+                loop {tpa::out::%{_sid}%::*}:
+                    set {_tid} to loop-index-2
+                    add 1 to {_n}
+                    send "<dark_gray> · <white>%{tpa::r::%{_sid}%::%{_tid}%::sname}%<gray> %{tpa::r::%{_sid}%::%{_tid}%::type}% <white>%{tpa::r::%{_sid}%::%{_tid}%::tname}%<dark_gray> (%tp_dur(tpa_left({_sid}, {_tid}))% left)"
+            if {_n} is 0:
+                send "%tpfx()%<gray>Nothing pending."
+
+        else if {_a} is "clear":
+            if arg-2 is not set:
+                send "%tpfx()%<red>/tpadmin clear <player|all>"
+                stop
+            if arg-2 is "all":
+                delete {tpa::r::*}
+                delete {tpa::in::*}
+                delete {tpa::out::*}
+                send "%tpfx()%<green>All pending requests dropped."
+            else:
+                set {_t} to arg-2 parsed as offline player
+                if {_t} is not set:
+                    send "%tpfx()%<red>Never heard of them."
+                    stop
+                set {_id} to "%uuid of {_t}%"
+                clear {_pairs::*}
+                loop {tpa::in::%{_id}%::*}:
+                    add "%loop-index%|%{_id}%" to {_pairs::*}
+                loop {tpa::out::%{_id}%::*}:
+                    add "%{_id}%|%loop-index%" to {_pairs::*}
+                loop {_pairs::*}:
+                    set {_x::*} to loop-value split at "|"
+                    tpa_drop({_x::1}, {_x::2})
+                send "%tpfx()%<green>Cleared <white>%size of {_pairs::*}%<green> request(s) for %{_t}%."
+
+        else if {_a} is "warmups":
+            set {_n} to 0
+            loop all players:
+                if tp_warming(loop-player) is true:
+                    add 1 to {_n}
+                    send "<dark_gray> · <white>%loop-player%"
+            send "%tpfx()%<gray>%{_n}% warmup(s) running."
+
+        else:
+            send "%tpfx()%<gray>/tpadmin info · requests · warmups"
+            send "%tpfx()%<gray>/tpadmin config [list|<key> [value]|reset]"
+            send "%tpfx()%<gray>/tpadmin clear <player|all>"
+            send "%tpfx()%<gray>/rtpadmin <dark_gray>for the wilderness side"
+
+
+# ============================================================================
+#  RTP ADMIN
+# ============================================================================
+
+command /rtpadmin [<text>] [<text>]:
+    permission: teleport.admin
+    permission message: <red>No.
+    trigger:
+        set {_a} to (arg-1 ? "help") in lower case
+
+        if {_a} is "info":
+            send "%tpfx()%<gray>Near ring <white>%tp_comma({tp::cfg::rtp_near_min})%<gray> to <white>%tp_comma({tp::cfg::rtp_near_max})%<gray> blocks"
+            send "%tpfx()%<gray>Far ring <white>%tp_comma({tp::cfg::rtp_far_min})%<gray> to <white>%tp_comma({tp::cfg::rtp_far_max})%<gray> blocks"
+            send "%tpfx()%<gray>Warmup <white>%{tp::cfg::rtp_warmup}%s<gray> · cooldown <white>%tp_dur({tp::cfg::rtp_cooldown})%<gray> · cost <white>%tp_comma({tp::cfg::rtp_cost})%"
+            send "%tpfx()%<gray>Budget <white>%{tp::cfg::rtp_hops}%<gray> hops x <white>%{tp::cfg::rtp_sweep}%<gray> free checks each"
+            send ""
+            send "%tpfx()%<gray>Trips served <white>%tp_comma({rtp::served} ? 0)%"
+            if ({rtp::served} ? 0) > 0:
+                send "%tpfx()%<gray>Average <white>%tp_r(({rtp::hops} ? 0) / {rtp::served}, 2)%<gray> hop(s) per trip"
+                send "%tpfx()%<dark_gray>One hop is one async chunk load. An average near the"
+                send "%tpfx()%<dark_gray>limit (%{tp::cfg::rtp_hops}%) means the safety filters are too tight."
+
+        else:
+            send "%tpfx()%<gray>/rtpadmin info"
+            send "%tpfx()%<gray>Ring distances are config keys -- change them with /tpadmin:"
+            send "<dark_gray> · <gray>/tpadmin config rtp_near_max 75000"
+            send "<dark_gray> · <gray>/tpadmin config rtp_far_min 75000"
+            send "<dark_gray> · <gray>/tpadmin config rtp_far_max 100000"
+            send "<dark_gray> · <gray>/tpadmin config rtp_hops 12 <dark_gray>· rtp_sweep 24"

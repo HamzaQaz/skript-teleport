@@ -1,0 +1,346 @@
+# ============================================================================
+#  TELEPORT SUITE  ·  03-rtp
+#  Simple two-tier wilderness teleport.
+#
+#    /rtp            somewhere within 75,000 blocks
+#    /rtp far        somewhere between 75,000 and 100,000 blocks
+#
+#  No biome picking, no cache, no menu. Two commands.
+# ----------------------------------------------------------------------------
+#  THE ONE RULE: never read a block from an unloaded chunk.
+#
+#  `highest block at` on a chunk that is not loaded calls syncLoad, which
+#  BLOCKS the main thread until that chunk is read from disk or generated.
+#  At these distances every candidate is virgin terrain, so doing it in a
+#  background loop parks the whole server -- a profiler shows it as ~97% of
+#  server thread time sitting in LockSupport.parkNanos. That is not lag,
+#  that is the tick loop waiting.
+#
+#  Teleporting a player is the one thing Paper loads chunks ASYNCHRONOUSLY
+#  for. So the search flies the player to each candidate rather than
+#  reaching out to it: teleport high above the point, wait for the chunk to
+#  arrive, and only then read blocks -- which is now free, because they are
+#  resident.
+#
+#  And once the player is up there, their view distance has loaded the whole
+#  neighbourhood, so rtp_sweep() tests a couple of dozen more points nearby
+#  for nothing. One chunk load buys many candidates instead of one.
+#
+#  Do not "optimise" this back into a background task.
+# ============================================================================
+
+function rtp_seed():
+    # Ring distances, in blocks from 0,0.
+    tp_default("rtp_near_min", 0)
+    tp_default("rtp_near_max", 75000)
+    tp_default("rtp_far_min", 75000)
+    tp_default("rtp_far_max", 100000)
+
+    # Comma separated. RTP in the End or a minigame world would spend every
+    # hop over void and then fail, so it is refused outright instead.
+    tp_default("rtp_worlds", "world")
+
+    tp_default("rtp_hops", 12)          # teleports before giving up
+    tp_default("rtp_sweep", 24)         # free nearby checks per hop
+    tp_default("rtp_probe", 320)        # hover height while the chunk loads
+    tp_default("rtp_probe_roofed", 250) # ...above a nether-style roof
+
+    if {tp::cfg::rtp::badblock::*} is not set:
+        set {tp::cfg::rtp::badblock::*} to "lava", "fire", "magma", "cactus", "powder_snow", "sweet_berry", "campfire", "leaves", "bedrock", "wither_rose", "pointed_dripstone", "cobweb", "portal" and "scaffolding"
+    if {tp::cfg::rtp::wetbiome::*} is not set:
+        set {tp::cfg::rtp::wetbiome::*} to "ocean", "river" and "deep"
+
+on load:
+    rtp_seed()
+    log "[Teleport] RTP loaded. near 0-%{tp::cfg::rtp_near_max}%, far %{tp::cfg::rtp_far_min}%-%{tp::cfg::rtp_far_max}%."
+
+
+# ============================================================================
+#  GEOMETRY
+# ============================================================================
+
+# Uniform over AREA, not over radius. r = sqrt(u) scaled between the rings.
+# Picking a uniform radius instead crowds everyone into the middle and the
+# outer half of the ring never gets used.
+function rtp_point(w: world, min: number, max: number) :: location:
+    set {_u} to random number between 0 and 1
+    set {_r} to sqrt(({_min} ^ 2) + ({_u} * (({_max} ^ 2) - ({_min} ^ 2))))
+    set {_a} to random number between 0 and 360
+    set {_x} to round({_r} * cos({_a}))
+    set {_z} to round({_r} * sin({_a}))
+    return location({_x}, 64, {_z}, {_w})
+
+# Worlds with a solid ceiling need scanning downward instead of asking for
+# the highest block, which up there is the roof itself.
+function rtp_roofed(w: world) :: boolean:
+    if "%{_w}%" contains "nether":
+        return true
+    return false
+
+function rtp_probe_y(w: world) :: number:
+    if rtp_roofed({_w}) is true:
+        return {tp::cfg::rtp_probe_roofed}
+    return {tp::cfg::rtp_probe}
+
+# Substring test rather than `is air`, so cave air and void air are covered
+# without naming block types that have been renamed before and will be again.
+function rtp_open(b: block) :: boolean:
+    if "%type of {_b}%" contains "air":
+        return true
+    return false
+
+function rtp_bad_block(b: block) :: boolean:
+    set {_t} to "%type of {_b}%" in lower case
+    if {_t} contains "water":
+        if {tp::cfg::rtp_water} is false:
+            return true
+    loop {tp::cfg::rtp::badblock::*}:
+        if {_t} contains loop-value:
+            return true
+    return false
+
+# The block a player would stand ON, or nothing.
+function rtp_ground(w: world, x: number, z: number) :: block:
+    if rtp_roofed({_w}) is false:
+        set {_b} to highest block at location({_x}, 64, {_z}, {_w})
+        if rtp_open({_b}) is true:
+            return {_nothing}
+        return {_b}
+
+    # roofed: walk down looking for a floor with two blocks of headroom
+    loop 70 times:
+        set {_y} to 101 - loop-value
+        set {_b} to block at location({_x}, {_y}, {_z}, {_w})
+        if rtp_open({_b}) is false:
+            if rtp_open(block above {_b}) is true:
+                if rtp_open(block above (block above {_b})) is true:
+                    return {_b}
+    return {_nothing}
+
+function rtp_biome_ok(l: location) :: boolean:
+    if {tp::cfg::rtp_water} is true:
+        return true
+    set {_k} to tp_biome_key({_l})
+    loop {tp::cfg::rtp::wetbiome::*}:
+        if {_k} contains loop-value:
+            return false
+    return true
+
+function rtp_ok(stand: location) :: boolean:
+    set {_g} to block at location(x of {_stand}, (y of {_stand}) - 1, z of {_stand}, world of {_stand})
+    if rtp_open({_g}) is true:
+        return false
+    if rtp_bad_block({_g}) is true:
+        return false
+    if rtp_bad_block(block at {_stand}) is true:
+        return false
+    if rtp_open(block at {_stand}) is false:
+        return false
+    if rtp_open(block above (block at {_stand})) is false:
+        return false
+    if rtp_biome_ok({_stand}) is false:
+        return false
+    if rtp_claim_free({_stand}) is false:
+        return false
+    return true
+
+
+# ---------------------------------------------------------------------------
+#  CLAIM HOOK  --  UNCONFIGURED
+#
+#  Skript cannot query Lands without an addon and the placeholder names move
+#  between Lands releases, so guessing here would be worse than admitting it.
+#  Returns true (allow) until you wire it up.
+#
+#  Your Lands claim-worlds list is 'world' only, and nobody has claimed
+#  anywhere near 75,000 blocks out, so in practice this does not bite yet.
+# ---------------------------------------------------------------------------
+
+function rtp_claim_free(l: location) :: boolean:
+    return true
+
+
+# ============================================================================
+#  THE SEARCH
+# ============================================================================
+
+# Never reads a block from an unloaded chunk. Returns nothing instead of
+# blocking, which is the entire point of this file.
+function rtp_try_loaded(w: world, x: number, z: number) :: location:
+    if chunk at location({_x}, 64, {_z}, {_w}) is not loaded:
+        return {_nothing}
+    set {_g} to rtp_ground({_w}, {_x}, {_z})
+    if {_g} is not set:
+        return {_nothing}
+    set {_stand} to location((x of {_g}) + 0.5, (y of {_g}) + 1, (z of {_g}) + 0.5, {_w})
+    if rtp_ok({_stand}) is false:
+        return {_nothing}
+    return {_stand}
+
+# Sample the neighbourhood the player just loaded around themselves. All of
+# it is resident, so the whole sweep costs no chunk I/O at all.
+function rtp_sweep(w: world, centre: location) :: location:
+    set {_cx} to x of {_centre}
+    set {_cz} to z of {_centre}
+
+    set {_hit} to rtp_try_loaded({_w}, {_cx}, {_cz})
+    if {_hit} is set:
+        return {_hit}
+
+    loop {tp::cfg::rtp_sweep} times:
+        set {_a} to random number between 0 and 360
+        set {_r} to random number between 8 and 56
+        set {_x} to round({_cx} + ({_r} * cos({_a})))
+        set {_z} to round({_cz} + ({_r} * sin({_a})))
+        set {_hit} to rtp_try_loaded({_w}, {_x}, {_z})
+        if {_hit} is set:
+            return {_hit}
+    return {_nothing}
+
+
+# Entry point. The warmup has to come first or /rtp is a combat escape --
+# tp_land() in 00-core sees the pending marker and calls rtp_search()
+# instead of teleporting anywhere.
+function rtp_world_ok(w: text) :: boolean:
+    set {_list::*} to {tp::cfg::rtp_worlds} split at ","
+    loop {_list::*}:
+        if loop-value is {_w}:
+            return true
+    return false
+
+# Unwinds a countdown that never became a search: gives the fee back, drops
+# the cooldown, clears the markers. Safe to call for any player -- it does
+# nothing unless an /rtp is actually pending. rtp_search() clears the markers
+# the moment it starts, so a search already in flight is never touched.
+function rtp_abort(p: player):
+    set {_id} to "%uuid of {_p}%"
+    if {rtp::pend::w::%{_id}%} is not set:
+        stop
+    delete {rtp::pend::w::%{_id}%}
+    delete {rtp::pend::min::%{_id}%}
+    delete {rtp::pend::max::%{_id}%}
+    delete {rtp::home::%{_id}%}
+    delete {tp::cd::%{_id}%::rtp}
+    if {tp::cfg::rtp_cost} > 0:
+        add {tp::cfg::rtp_cost} to {_p}'s balance
+
+function rtp_go(p: player, tier: text):
+    set {_id} to "%uuid of {_p}%"
+
+    if rtp_world_ok("%world of {_p}%") is false:
+        tp_err({_p}, "You can't wander in this world.")
+        stop
+    if tp_warming({_p}) is true:
+        tp_err({_p}, "You're already teleporting.")
+        stop
+    if {rtp::pend::w::%{_id}%} is set:
+        tp_err({_p}, "You're already looking for somewhere.")
+        stop
+    if tp_cd_ready({_p}, "rtp") is false:
+        stop
+
+    if {_tier} is "far":
+        set {_min} to {tp::cfg::rtp_far_min}
+        set {_max} to {tp::cfg::rtp_far_max}
+        set {_label} to "the far wilds"
+    else:
+        set {_min} to {tp::cfg::rtp_near_min}
+        set {_max} to {tp::cfg::rtp_near_max}
+        set {_label} to "the wilds"
+
+    tp_cd_set({_p}, "rtp", {tp::cfg::rtp_cooldown})
+    if tp_charge({_p}, {tp::cfg::rtp_cost}, "rtp") is false:
+        delete {tp::cd::%{_id}%::rtp}
+        stop
+
+    set {rtp::pend::w::%{_id}%} to "%world of {_p}%"
+    set {rtp::pend::min::%{_id}%} to {_min}
+    set {rtp::pend::max::%{_id}%} to {_max}
+    set {rtp::home::%{_id}%} to location of {_p}
+    tp_warmup({_p}, location of {_p}, "", "Heading into %{_label}%", "rtp")
+
+
+# The search proper. The player IS the chunk loader here.
+function rtp_search(p: player):
+    set {_id} to "%uuid of {_p}%"
+    set {_wn} to {rtp::pend::w::%{_id}%}
+    set {_min} to {rtp::pend::min::%{_id}%}
+    set {_max} to {rtp::pend::max::%{_id}%}
+    set {_home} to {rtp::home::%{_id}%} ? location of {_p}
+    delete {rtp::pend::w::%{_id}%}
+    delete {rtp::pend::min::%{_id}%}
+    delete {rtp::pend::max::%{_id}%}
+    delete {rtp::home::%{_id}%}
+
+    set {_w} to {_wn} parsed as world
+    set {_probe} to rtp_probe_y({_w})
+
+    # They are about to spend a few seconds in the sky. Neither of these is
+    # cosmetic -- without them a disconnect mid-search drops somebody from
+    # y=320.
+    set {tp::nofall::%{_id}%} to tp_now() + 60
+    apply slow falling 1 to {_p} for 30 seconds
+
+    set {_hops} to 0
+    loop {tp::cfg::rtp_hops} times:
+        if {_p} is not online:
+            stop
+        add 1 to {_hops}
+        set {_pt} to rtp_point({_w}, {_min}, {_max})
+        teleport {_p} to location(x of {_pt}, {_probe}, z of {_pt}, {_w})
+
+        # Let the async chunk load land before reading anything.
+        wait 4 ticks
+        if {_p} is not online:
+            stop
+
+        set {_dest} to rtp_sweep({_w}, location of {_p})
+        if {_dest} is set:
+            exit loop
+        send action bar "<aqua>Searching<gray>... <dark_gray>%{_hops}%/%{tp::cfg::rtp_hops}%" to {_p}
+
+    if {_dest} is not set:
+        teleport {_p} to {_home}
+        delete {tp::cd::%{_id}%::rtp}
+        if {tp::cfg::rtp_cost} > 0:
+            add {tp::cfg::rtp_cost} to {_p}'s balance
+        tp_err({_p}, "Couldn't find anywhere safe. Nothing was charged.")
+        stop
+
+    set {tp::back::%{_id}%} to {_home}
+    tp_sound({_p}, "entity.enderman.teleport", 1)
+    teleport {_p} to {_dest}
+    set {_p}'s fall distance to 0
+    add 1 to {rtp::count::%{_id}%}
+    add {_hops} to {rtp::hops}
+    add 1 to {rtp::served}
+    rtp_arrive({_p})
+
+function rtp_arrive(p: player):
+    set {_l} to location of {_p}
+    set {rtp::last::%uuid of {_p}%} to {_l}
+    set {_d} to round(sqrt(((x of {_l}) ^ 2) + ((z of {_l}) ^ 2)))
+    tp_title({_p}, "<aqua>%tp_biome({_l})%", "<gray>%tp_comma(x of {_l})%, %floor(y of {_l})%, %tp_comma(z of {_l})%", 3)
+    tp_msg({_p}, "<gray>Dropped in <white>%tp_biome({_l})%<gray> at <white>%tp_comma(x of {_l})%, %floor(y of {_l})%, %tp_comma(z of {_l})%")
+    tp_msg({_p}, "<dark_gray>%tp_comma({_d})% blocks out · <white>/tpback<dark_gray> to return")
+
+
+# A disconnect during the countdown would otherwise leave the markers set
+# and rtp_go() would refuse forever.
+on quit:
+    rtp_abort(player)
+
+
+command /rtp [<text>]:
+    aliases: /wild, /tpr, /wilderness
+    permission: teleport.rtp
+    permission message: <red>You don't have access to that.
+    executable by: players
+    trigger:
+        set {_a} to (arg-1 ? "near") in lower case
+        if {_a} is "far":
+            rtp_go(player, "far")
+        else if {_a} is "near":
+            rtp_go(player, "near")
+        else:
+            tp_err(player, "<yellow>/rtp<red> or <yellow>/rtp far<red>.")
