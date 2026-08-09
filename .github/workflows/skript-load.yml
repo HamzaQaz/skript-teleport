@@ -75,12 +75,20 @@ jobs:
           echo "Skript: $SK"
           curl -sfL -o server/plugins/Skript.jar "$SK"
 
-          # Without Vault, Skript never registers the `balance` expression and
-          # every money line reports a parse error that is not real.
+          # Vault alone is not enough: Skript only registers the `balance`
+          # expression when an economy PROVIDER has registered with Vault, so
+          # without one every money line fails to parse and the run reports
+          # errors that do not exist on a real server. EssentialsX is the
+          # provider in production, so it is the provider here too.
           VA=$(curl -sf https://api.github.com/repos/MilkBowl/Vault/releases/latest \
                | jq -r '[.assets[] | select(.name | endswith(".jar"))] | .[0].browser_download_url')
           echo "Vault: $VA"
           curl -sfL -o server/plugins/Vault.jar "$VA"
+
+          ES=$(curl -sf https://api.github.com/repos/EssentialsX/Essentials/releases/latest \
+               | jq -r '[.assets[] | select(.name | test("^EssentialsX-[0-9]"))] | .[0].browser_download_url')
+          echo "EssentialsX: $ES"
+          curl -sfL -o server/plugins/EssentialsX.jar "$ES"
 
       - name: Stage scripts and server config
         run: |
